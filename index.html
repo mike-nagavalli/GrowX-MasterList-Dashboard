@@ -360,10 +360,9 @@
 
 <script>
 // ── CONFIG ──────────────────────────────────────────────────────────────
-// Uses Google Visualization JSONP — works without any CORS proxy
-const SHEET_DOC_ID = '2PACX-1vQZzG4czFlQugqA_N2NopiMsy8anlmcRJdM2Cc8PNWTyTIGA_jhsQDMc1OZupmN00Cs9YaeNT8ihxNC';
-const SHEET_GID    = '431931840';
-const PAGE_SIZE    = 20;
+// Direct CSV fetch — works from GitHub Pages, no proxy needed
+const CSV_URL   = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQZzG4czFlQugqA_N2NopiMsy8anlmcRJdM2Cc8PNWTyTIGA_jhsQDMc1OZupmN00Cs9YaeNT8ihxNC/pub?gid=431931840&single=true&output=csv';
+const PAGE_SIZE = 20;
 
 // ── STATE ────────────────────────────────────────────────────────────────
 let allData=[], filteredData=[];
@@ -373,75 +372,55 @@ let taskSort={col:'SrNo',asc:true}, etaSort={col:'ETA',asc:true};
 let pendSort={col:'SrNo',asc:true}, cbuaeSort={col:'SrNo',asc:true};
 let modSort={col:'total',asc:false};
 
-// ── LOAD VIA GOOGLE VISUALIZATION JSONP ──────────────────────────────────
-// This approach uses Google's own gviz/tq endpoint with JSONP callback.
-// It does NOT require any CORS proxy — Google allows this natively.
-function loadData(){
+// ── LOAD DATA ─────────────────────────────────────────────────────────────
+async function loadData(){
   const btn=document.getElementById('refreshBtn');
   btn.disabled=true; btn.classList.add('spinning');
   setLoading(true,'Connecting to Google Sheet…');
   hideError();
 
-  // Remove stale script tags from previous loads
-  document.querySelectorAll('.gviz-script').forEach(s=>s.remove());
+  try {
+    // Google's published CSV allows cross-origin fetch — no proxy needed
+    const res = await fetch(CSV_URL, {mode:'cors'});
+    if(!res.ok) throw new Error(`Google returned HTTP ${res.status}. Make sure the sheet is published to the web.`);
+    const text = await res.text();
+    if(!text||text.length<50) throw new Error('Empty response from Google Sheet.');
+    if(text.trim().startsWith('<')) throw new Error('Google returned an HTML page instead of CSV. The sheet may not be published correctly.');
 
-  const cbName = '__gviz_cb_' + Date.now();
-  const url = `https://docs.google.com/spreadsheets/d/e/${SHEET_DOC_ID}/gviz/tq?tqx=out:json&gid=${SHEET_GID}&headers=1&callback=${cbName}`;
+    setLoading(true,'Parsing data…');
+    allData = parseCSV(text);
+    if(!allData.length) throw new Error('No valid data rows found. Make sure the New Master tab is published.');
 
-  const cleanup = ()=>{ delete window[cbName]; };
-
-  // Timeout fallback
-  const timer = setTimeout(()=>{
-    cleanup();
+    filteredData=[...allData];
+    initFilters();
+    applyFilters();
+    document.getElementById('lastRefresh').innerHTML=`✓ ${allData.length} rows<br>${new Date().toLocaleTimeString()}`;
     setLoading(false);
-    showError(`Request timed out.<br><br>
-      Please ensure:<br>
-      1. You are connected to the internet<br>
-      2. The sheet is shared: <em>File → Share → Publish to web → New Master → CSV → Publish</em>`);
-    document.getElementById('lastRefresh').textContent='Timed out';
-    btn.disabled=false; btn.classList.remove('spinning');
-  }, 15000);
 
-  window[cbName] = function(raw){
-    clearTimeout(timer); cleanup();
-    btn.disabled=false; btn.classList.remove('spinning');
-    try {
-      if(!raw||!raw.table) throw new Error('Google returned no table data. Check the sheet is published.');
-      allData = parseGviz(raw.table);
-      if(!allData.length) throw new Error('Zero valid rows parsed. Verify the New Master sheet tab is published.');
-      filteredData=[...allData];
-      initFilters();
-      applyFilters();
-      document.getElementById('lastRefresh').innerHTML=`✓ ${allData.length} rows<br>${new Date().toLocaleTimeString()}`;
-      setLoading(false);
-    } catch(e){
-      setLoading(false);
-      showError('Parsed error: '+e.message);
-      document.getElementById('lastRefresh').textContent='Error';
-    }
-  };
-
-  const s=document.createElement('script');
-  s.className='gviz-script'; s.src=url;
-  s.onerror=()=>{
-    clearTimeout(timer); cleanup();
+  } catch(err){
     setLoading(false);
-    showError(`Could not load from Google Sheets.<br><br>
-      Please check:<br>
-      1. Internet connection is active<br>
-      2. Sheet is published: <em>File → Share → Publish to web</em><br>
-      3. "New Master" tab selected, format = CSV, then click Publish`);
+    showError(`Could not load data: ${err.message}<br><br>
+      <strong>Please check:</strong><br>
+      1. In Google Sheets: <em>File → Share → Publish to web</em><br>
+      2. Select <strong>New Master</strong> tab → <strong>CSV</strong> format → click <strong>Publish</strong><br>
+      3. Also set <em>Share → Anyone with the link → Viewer</em><br>
+      4. Click <strong>Refresh from Sheet</strong> to try again`);
     document.getElementById('lastRefresh').textContent='Failed';
-    btn.disabled=false; btn.classList.remove('spinning');
-  };
-  document.head.appendChild(s);
+  }
+
+  btn.disabled=false; btn.classList.remove('spinning');
 }
 
-// ── PARSE GVIZ TABLE ──────────────────────────────────────────────────────
-function parseGviz(table){
-  const cols=table.cols.map(c=>(c.label||c.id||'').replace(/\s+/g,' ').trim());
+// ── PARSE CSV ─────────────────────────────────────────────────────────────
+function parseCSV(text){
+  const lines=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(l=>l.trim());
+  if(lines.length<2) return [];
+
+  const headers=parseRow(lines[0]);
+  const norm=h=>h.replace(/[\n\r]+/g,' ').replace(/\s{2,}/g,' ').trim();
+  const normed=headers.map(norm);
   const find=(...names)=>{
-    for(const n of names){ const i=cols.findIndex(h=>h.toLowerCase()===n.toLowerCase()); if(i>=0) return i; }
+    for(const n of names){ const i=normed.findIndex(h=>h.toLowerCase()===n.toLowerCase()); if(i>=0) return i; }
     return -1;
   };
   const C={
@@ -457,98 +436,32 @@ function parseGviz(table){
     Reason:      find('Reason'),
     CBUAE:       find('CBUAE'),
   };
-  const gv=(row,key)=>{
-    const i=C[key]; if(i<0||!row.c||!row.c[i]) return '';
-    const cell=row.c[i]; if(cell==null) return '';
-    if(cell.f!=null) return String(cell.f).trim();
-    if(cell.v!=null) return String(cell.v).trim();
-    return '';
-  };
-  const rows=[];
-  for(const row of (table.rows||[])){
-    const srNo=parseFloat(gv(row,'SrNo'));
-    if(!srNo||isNaN(srNo)) continue;
-    const task=gv(row,'Task');
-    if(!task||/insert row|above this line/i.test(task)) continue;
-    rows.push({
-      SrNo:srNo, PortalType:gv(row,'PortalType'), Module:gv(row,'Module'),
-      Task:task, Release:gv(row,'Release').trim(), Team:gv(row,'Team').trim(),
-      Status:gv(row,'Status')||'Pending', CompletePct:parseFloat(gv(row,'CompletePct'))||0,
-      ETA:gv(row,'ETA')||null, Reason:gv(row,'Reason')||null, CBUAE:gv(row,'CBUAE')||null,
-    });
-  }
-  return rows;
-}
-
-function parseCSV(text){
-  // Split into lines, handle \r\n
-  const lines = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(l=>l.trim());
-  if(lines.length<2) return [];
-
-  const headers = parseRow(lines[0]);
-  // Normalise header names (remove extra spaces/newlines)
-  const norm = h => h.replace(/[\n\r]+/g,' ').replace(/\s{2,}/g,' ').trim();
-  const normed = headers.map(norm);
-
-  // Find column indices flexibly
-  const find = (...names) => {
-    for(const n of names){
-      const i = normed.findIndex(h=>h.toLowerCase()===n.toLowerCase());
-      if(i>=0) return i;
-    }
-    return -1;
-  };
-
-  const C = {
-    SrNo:        find('Sr.No.','SrNo','Sr No','#') ,
-    PortalType:  find('Portal  Type','Portal Type','PortalType'),
-    Module:      find('Module  Name','Module Name','Module'),
-    Task:        find('Task (Screen Name)','Task (Screen name)','Task'),
-    Release:     find('Release'),
-    Team:        find('Team Responsible','Team'),
-    Status:      find('Overall  Dev. Status','Overall Dev. Status','Dev Status','Status'),
-    CompletePct: find('Overall  Complete %','Overall Complete %','Complete %','CompletePct'),
-    ETA:         find('ETA'),
-    Reason:      find('Reason'),
-    CBUAE:       find('CBUAE'),
-  };
 
   const rows=[];
   for(let i=1;i<lines.length;i++){
     const cols=parseRow(lines[i]);
-    const g = k => C[k]>=0 ? (cols[C[k]]||'').trim() : '';
-    const srNo = parseFloat(g('SrNo'));
+    const g=k=>C[k]>=0?(cols[C[k]]||'').trim():'';
+    const srNo=parseFloat(g('SrNo'));
     if(!srNo||isNaN(srNo)) continue;
     const task=g('Task');
-    if(!task||task.toLowerCase().includes('insert row')||task.toLowerCase().includes('above this line')) continue;
+    if(!task||/insert row|above this line/i.test(task)) continue;
     rows.push({
-      SrNo:        srNo,
-      PortalType:  g('PortalType'),
-      Module:      g('Module'),
-      Task:        task,
-      Release:     g('Release').trim(),
-      Team:        g('Team').trim(),
-      Status:      g('Status')||'Pending',
-      CompletePct: parseFloat(g('CompletePct'))||0,
-      ETA:         g('ETA')||null,
-      Reason:      g('Reason')||null,
-      CBUAE:       g('CBUAE')||null,
+      SrNo:srNo, PortalType:g('PortalType'), Module:g('Module'),
+      Task:task, Release:g('Release').trim(), Team:g('Team').trim(),
+      Status:g('Status')||'Pending', CompletePct:parseFloat(g('CompletePct'))||0,
+      ETA:g('ETA')||null, Reason:g('Reason')||null, CBUAE:g('CBUAE')||null,
     });
   }
   return rows;
 }
 
 function parseRow(line){
-  // RFC-4180 CSV parser
   const cols=[]; let cur='', inQ=false;
   for(let i=0;i<line.length;i++){
     const ch=line[i];
-    if(ch==='"'){
-      if(inQ&&line[i+1]==='"'){cur+='"';i++;}
-      else inQ=!inQ;
-    } else if(ch===','&&!inQ){
-      cols.push(cur);cur='';
-    } else { cur+=ch; }
+    if(ch==='"'){ if(inQ&&line[i+1]==='"'){cur+='"';i++;} else inQ=!inQ; }
+    else if(ch===','&&!inQ){ cols.push(cur); cur=''; }
+    else { cur+=ch; }
   }
   cols.push(cur);
   return cols;
